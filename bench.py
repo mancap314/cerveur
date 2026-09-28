@@ -185,7 +185,8 @@ def main():
     }
     names = args.only.split(",") if args.only else list(scenarios)
 
-    srv = subprocess.Popen([args.server, "--bind=127.0.0.1", str(args.port), str(len(scpus))],
+    server = os.path.abspath(args.server) if os.path.exists(args.server) else args.server
+    srv = subprocess.Popen([server, "--bind=127.0.0.1", str(args.port), str(len(scpus))],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     results = {}
     try:

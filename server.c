@@ -8,6 +8,11 @@
  * ports, built with MinGW-w64; see "Platform layer" and "Windows: I/O
  * completion ports" below).
  *
+ * Built as is, this is a demo program (the routes near the end). Built with
+ * -DSERVER_NO_MAIN, it is a library for your own C or C++ program: the API is
+ * in server.h, you start it with http_server_main(argc, argv, routes), and
+ * example.cpp shows handlers written in C++.
+ *
  * ------------------------------------------------------------------------
  * HTTP layer
  * ------------------------------------------------------------------------
@@ -294,11 +299,6 @@ static const void* mem_find(const void* hay, size_t n, const void* needle, size_
 /* ---- Limits ---- */
 #define IN_CAP        16384    /* socket read buffer per connection */
 #define IN_BIG_CAP    65536    /* ... grown to this while it receives bulk data */
-#ifndef OUT_CAP                /* response buffer per active request (-DOUT_CAP=131072 moves
-                                  large bodies with ~10% less CPU on Windows, but every open
-                                  WebSocket / SSE stream keeps one for its whole life) */
-#define OUT_CAP       32768
-#endif
 #define HDR_ARENA     8192     /* request line + headers; beyond this -> 431 */
 #define MAX_HEADERS   64
 #define MAX_PARAMS    8
@@ -353,116 +353,9 @@ static const void* mem_find(const void* hay, size_t n, const void* needle, size_
 #define MAX_MIGRATE   64
 #endif
 
-/* ======================================================================== */
-/* Public HTTP API                                                          */
-/* ======================================================================== */
+#include "server.h"             /* the public API: types and functions for handlers */
 
-typedef struct { const char* ptr; size_t len; } http_str;
-typedef struct { http_str name, value; } http_header;
-typedef struct http_ctx http_ctx;
-
-typedef void (*http_handler_fn)(http_ctx* x);
-typedef int  (*http_stream_fn)(void* task);
-
-typedef struct {
-    const char* method;        /* "GET", "POST", ... or NULL for any method */
-    const char* pattern;       /* e.g. "/users/:id", or "/static/" followed by "*path" */
-    http_handler_fn handle;    /* buffered handler, or ... */
-    http_stream_fn  stream;    /* ... streaming handler coroutine, or ... */
-    http_stream_fn  websocket; /* ... WebSocket handler coroutine */
-    size_t task_size;          /* streaming/WebSocket: sizeof the task struct */
-    size_t body_limit;         /* buffered: max request body (0 = default) */
-} http_route;
-
-/* Every streaming task struct starts with these two fields. The connection
-   allocates the struct zeroed, sets x, and resumes it until it's done.
-
-   IMPORTANT (stackless coroutines): local variables do not survive a
-   cco_await. Anything used after an await, including inside the awaited
-   condition itself (it is re-evaluated on every resume), must be a field of
-   the task struct. GCC's -Wmaybe-uninitialized usually catches mistakes. */
-#define HTTP_TASK cco_base base; http_ctx* x
 struct http_task { HTTP_TASK; };
-
-/* Request accessors */
-static http_str    http_method(const http_ctx* x);
-static http_str    http_path(const http_ctx* x);
-static http_str    http_header_get(const http_ctx* x, const char* name);
-static http_str    http_param(const http_ctx* x, const char* name);
-static bool        http_query(const http_ctx* x, const char* key, char* buf, size_t cap);
-static http_str    http_body(const http_ctx* x);           /* buffered handlers */
-/* The real client's address: from the PROXY protocol, or from X-Forwarded-For
-   when the connection comes from a --trust-proxy address (walking the list
-   right to left past trusted hops, so clients can't spoof it). */
-static const char* http_client_ip(http_ctx* x);
-static const char* http_scheme(http_ctx* x);   /* "https" if a trusted proxy says so */
-
-/* Streaming request body (streaming handlers) */
-static bool        http_body_ready(http_ctx* x);   /* await: a chunk is ready or the body ended */
-static bool        http_body_done(const http_ctx* x);
-static http_str    http_body_take(http_ctx* x);    /* valid until the next http_body_ready();
-                                                       at most HTTP_SEND_MAX bytes */
-
-/* Responses */
-static void        http_set_header(http_ctx* x, const char* name, const char* value);
-static void        http_respond(http_ctx* x, int status, const char* ctype, const void* body, size_t len);
-static void        http_respondf(http_ctx* x, int status, const char* ctype, const char* fmt, ...)
-                       PRINTF_LIKE(4, 5);
-static void        http_start(http_ctx* x, int status, const char* ctype);    /* streamed body */
-static bool        http_send(http_ctx* x, const void* data, size_t len);      /* await: all-or-nothing */
-static bool        http_sendf(http_ctx* x, const char* fmt, ...) PRINTF_LIKE(2, 3);
-static void        http_end(http_ctx* x);
-#define HTTP_SEND_MAX (OUT_CAP - 64)   /* largest single http_send() */
-
-/* Timers, for streaming and WebSocket handlers. A handler can wait for a
-   timer and other events at once:
-       cco_await(ws_recv_ready(x) || http_timer_done(x, &t->tick));
-   While a handler waits on a timer, the connection's idle timeout is paused. */
-typedef struct { int64_t when; } http_timer;
-static void http_timer_start(http_ctx* x, http_timer* t, int64_t ms);
-static bool http_timer_done(http_ctx* x, http_timer* t);                  /* await */
-static bool http_timer_expired(const http_ctx* x, const http_timer* t);   /* check only */
-#define http_sleep(x, t, ms) do { http_timer_start(x, t, ms); cco_await(http_timer_done(x, t)); } while (0)
-
-/* WebSocket (RFC 6455). A route with .websocket upgrades the connection and
-   runs the handler coroutine. The server unmasks and reassembles fragmented
-   messages, validates UTF-8 in text messages, answers pings, and runs the
-   close handshake; protocol violations close with the proper status code.
-   Once the close handshake completes, the handler is stopped (its
-   cco_finalize block runs). */
-enum { WS_TEXT = 1, WS_BINARY = 2 };
-typedef struct { int opcode; const char* data; size_t len; } ws_message;
-static bool       ws_recv_ready(http_ctx* x);     /* await: a message arrived, or the connection closed */
-static bool       ws_has_message(const http_ctx* x);
-static ws_message ws_recv(http_ctx* x);           /* valid until the next ws_recv_ready() */
-static bool       ws_closed(const http_ctx* x);   /* closed, and no messages left to read */
-static int        ws_close_code(const http_ctx* x) __attribute__((unused));  /* peer's code; 1006 if dropped */
-static bool       ws_send(http_ctx* x, int opcode, const void* data, size_t len);   /* await */
-static bool       ws_sendf(http_ctx* x, const char* fmt, ...) PRINTF_LIKE(2, 3);
-static void       ws_close(http_ctx* x, int code, const char* reason);
-
-/* Publish/subscribe between connections, across all reactor threads.
-   Any handler can publish. Streaming and WebSocket handlers can subscribe
-   (up to PS_MAX_TOPICS topics) and then wait for messages, alone or together
-   with other events:
-       cco_await(ws_recv_ready(x) || ps_ready(x));
-   Messages from one publisher arrive in order. Publishing never blocks: a
-   subscriber's mailbox grows with its backlog, and if it falls PS_QUEUE
-   messages behind, its oldest are dropped and counted (ps_lagged): every
-   message is either delivered or reported as skipped. Subscriptions end automatically with the handler, and
-   follow the connection when it migrates to another thread. */
-typedef struct { const char* topic; int opcode; const char* data; size_t len; } ps_message;
-static int        ps_publish(const char* topic, int opcode, const void* data, size_t len);  /* -> subscribers reached */
-static bool       ps_subscribe(http_ctx* x, const char* topic);
-static void       ps_unsubscribe(http_ctx* x, const char* topic) __attribute__((unused));
-static bool       ps_ready(http_ctx* x);          /* await: a message is waiting */
-static ps_message ps_recv(http_ctx* x);           /* valid until the next ps_ready() */
-static unsigned   ps_lagged(http_ctx* x);         /* messages dropped since the last call */
-
-static bool http_str_eq(http_str s, const char* lit) {
-    size_t n = strlen(lit);
-    return s.len == n && memcmp(s.ptr, lit, n) == 0;
-}
 
 /* ======================================================================== */
 /* Runtime structures                                                       */
@@ -1134,11 +1027,11 @@ static int fill(struct conn* c) {
 /* Request accessors                                                        */
 /* ======================================================================== */
 
-static http_str http_method(const http_ctx* x) { return x->method; }
-static http_str http_path(const http_ctx* x) { return x->path; }
-static http_str http_body(const http_ctx* x) { return (http_str){x->body ? x->body : "", x->body_len}; }
+http_str http_method(const http_ctx* x) { return x->method; }
+http_str http_path(const http_ctx* x) { return x->path; }
+http_str http_body(const http_ctx* x) { return (http_str){x->body ? x->body : "", x->body_len}; }
 
-static http_str http_header_get(const http_ctx* x, const char* name) {
+http_str http_header_get(const http_ctx* x, const char* name) {
     size_t n = strlen(name);
     for (int i = 0; i < x->nheaders; ++i)
         if (x->headers[i].name.len == n && strncasecmp(x->headers[i].name.ptr, name, n) == 0)
@@ -1146,7 +1039,7 @@ static http_str http_header_get(const http_ctx* x, const char* name) {
     return (http_str){NULL, 0};
 }
 
-static http_str http_param(const http_ctx* x, const char* name) {
+http_str http_param(const http_ctx* x, const char* name) {
     for (int i = 0; i < x->nparams; ++i)
         if (http_str_eq(x->params[i].name, name)) return x->params[i].value;
     return (http_str){NULL, 0};
@@ -1180,7 +1073,7 @@ static int url_decode(http_str src, char* dst, size_t cap, bool plus_is_space) {
 }
 
 /* Find query parameter `key`, decode its value into buf. */
-static bool http_query(const http_ctx* x, const char* key, char* buf, size_t cap) {
+bool http_query(const http_ctx* x, const char* key, char* buf, size_t cap) {
     size_t klen = strlen(key);
     const char* p = x->query.ptr;
     const char* end = p + x->query.len;
@@ -1200,15 +1093,15 @@ static bool http_query(const http_ctx* x, const char* key, char* buf, size_t cap
 
 /* ---- Streaming request body ---- */
 
-static bool http_body_ready(http_ctx* x) {
+bool http_body_ready(http_ctx* x) {
     if (x->chunk.len > 0 || x->msg_done) return true;
     x->want_body = true;        /* tells the connection to read and parse more */
     return false;
 }
-static bool http_body_done(const http_ctx* x) { return x->msg_done && x->chunk.len == 0; }
+bool http_body_done(const http_ctx* x) { return x->msg_done && x->chunk.len == 0; }
 /* At most HTTP_SEND_MAX bytes at a time, so a chunk can always be passed
-   straight to http_send(); the rest stays for the next call. */
-static http_str http_body_take(http_ctx* x) {
+straight to http_send(); the rest stays for the next call. */
+http_str http_body_take(http_ctx* x) {
     http_str s = x->chunk;
     if (s.len > HTTP_SEND_MAX) s.len = HTTP_SEND_MAX;
     x->chunk.ptr += s.len;
@@ -1393,7 +1286,7 @@ static void out_compact(http_ctx* x) {
     x->out_off = 0;
 }
 
-static void http_set_header(http_ctx* x, const char* name, const char* value) {
+void http_set_header(http_ctx* x, const char* name, const char* value) {
     if (x->head_sent) return;
     int n = fmt_to(x->xhdr + x->xhdr_len, sizeof x->xhdr - (size_t)x->xhdr_len,
                    "%s: %s\r\n", name, value);
@@ -1431,7 +1324,7 @@ static void write_head(http_ctx* x, int status, const char* ctype, int64_t conte
     x->head_sent = true;
 }
 
-static void http_respond(http_ctx* x, int status, const char* ctype, const void* body, size_t len) {
+void http_respond(http_ctx* x, int status, const char* ctype, const void* body, size_t len) {
     if (x->head_sent) return;
     write_head(x, status, ctype, (int64_t)len);
     x->ended = true;
@@ -1448,7 +1341,7 @@ static void http_respond(http_ctx* x, int status, const char* ctype, const void*
     }
 }
 
-static void http_respondf(http_ctx* x, int status, const char* ctype, const char* fmt, ...) {
+void http_respondf(http_ctx* x, int status, const char* ctype, const char* fmt, ...) {
     char buf[4096];
     va_list ap;
     va_start(ap, fmt);
@@ -1459,7 +1352,7 @@ static void http_respondf(http_ctx* x, int status, const char* ctype, const char
     http_respond(x, status, ctype, buf, (size_t)n);
 }
 
-static void http_start(http_ctx* x, int status, const char* ctype) {
+void http_start(http_ctx* x, int status, const char* ctype) {
     write_head(x, status, ctype, -1);
 }
 
@@ -1482,7 +1375,7 @@ static void close_chunk(http_ctx* x) {
 /* Queue body bytes. All-or-nothing: returns false (and asks the connection to
    flush) if they don't fit yet, so handlers write cco_await(http_send(...)).
    Consecutive sends between flushes are coalesced into one chunk. */
-static bool http_send(http_ctx* x, const void* data, size_t len) {
+bool http_send(http_ctx* x, const void* data, size_t len) {
     if (!x->head_sent) http_start(x, 200, "application/octet-stream");
     if (x->ended || x->is_head || len == 0) return true;
     if (len > HTTP_SEND_MAX) len = HTTP_SEND_MAX;   /* contract violation: truncate */
@@ -1502,7 +1395,7 @@ static bool http_send(http_ctx* x, const void* data, size_t len) {
     return true;
 }
 
-static bool http_sendf(http_ctx* x, const char* fmt, ...) {
+bool http_sendf(http_ctx* x, const char* fmt, ...) {
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
@@ -1510,10 +1403,10 @@ static bool http_sendf(http_ctx* x, const char* fmt, ...) {
     va_end(ap);
     if (n < 0) return true;
     if (n >= (int)sizeof buf) n = sizeof buf - 1;
-    return http_send(x, buf, (size_t)n);
+return http_send(x, buf, (size_t)n);
 }
 
-static void http_end(http_ctx* x) {
+void http_end(http_ctx* x) {
     if (!x->head_sent) http_start(x, 200, "application/octet-stream");
     if (x->ended) return;
     x->ended = true;
@@ -1755,13 +1648,13 @@ static void dispatch(http_ctx* x) {
 /* Handler timers                                                           */
 /* ======================================================================== */
 
-static void http_timer_start(http_ctx* x, http_timer* t, int64_t ms) {
+void http_timer_start(http_ctx* x, http_timer* t, int64_t ms) {
     t->when = x->c->r->now + ms;
 }
-static bool http_timer_expired(const http_ctx* x, const http_timer* t) {
+bool http_timer_expired(const http_ctx* x, const http_timer* t) {
     return x->c->r->now >= t->when;
 }
-static bool http_timer_done(http_ctx* x, http_timer* t) {
+bool http_timer_done(http_ctx* x, http_timer* t) {
     if (http_timer_expired(x, t)) return true;
     timer_arm(x->c, t->when);   /* wake the connection then */
     return false;
@@ -2072,13 +1965,13 @@ static void ws_parse(struct conn* c) {
 
 /* ---- Handler API ---- */
 
-static bool ws_has_message(const http_ctx* x) { return x->ws_msg_ready; }
-static bool ws_closed(const http_ctx* x) {
+bool ws_has_message(const http_ctx* x) { return x->ws_msg_ready; }
+bool ws_closed(const http_ctx* x) {
     return !x->ws_msg_ready && (x->ws_close_received || x->ws_failed);
 }
-static int ws_close_code(const http_ctx* x) { return x->ws_close_code ? x->ws_close_code : 1006; }
+int ws_close_code(const http_ctx* x) { return x->ws_close_code ? x->ws_close_code : 1006; }
 
-static bool ws_recv_ready(http_ctx* x) {
+bool ws_recv_ready(http_ctx* x) {
     if (x->ws_msg_held) {                               /* release the previous message */
         x->ws_msg_held = false;
         x->ws_msg_len = 0;
@@ -2088,14 +1981,14 @@ static bool ws_recv_ready(http_ctx* x) {
     return false;
 }
 
-static ws_message ws_recv(http_ctx* x) {
+ws_message ws_recv(http_ctx* x) {
     if (!x->ws_msg_ready) return (ws_message){0, "", 0};
     x->ws_msg_ready = false;
     x->ws_msg_held = true;
     return (ws_message){x->ws_msg_op, x->ws_msg ? x->ws_msg : "", x->ws_msg_len};
 }
 
-static bool ws_send(http_ctx* x, int opcode, const void* data, size_t len) {
+bool ws_send(http_ctx* x, int opcode, const void* data, size_t len) {
     if (x->ws_close_queued || x->ws_failed) return true;   /* closing: drop */
     ws_queue_control(x);                                /* control frames go first */
     if (!x->ws_pong_pending && ws_put_frame(x, opcode, data, len)) return true;
@@ -2103,7 +1996,7 @@ static bool ws_send(http_ctx* x, int opcode, const void* data, size_t len) {
     return false;
 }
 
-static bool ws_sendf(http_ctx* x, const char* fmt, ...) {
+bool ws_sendf(http_ctx* x, const char* fmt, ...) {
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
@@ -2111,10 +2004,10 @@ static bool ws_sendf(http_ctx* x, const char* fmt, ...) {
     va_end(ap);
     if (n < 0) return true;
     if (n >= (int)sizeof buf) n = sizeof buf - 1;
-    return ws_send(x, WS_TEXT, buf, (size_t)n);
+return ws_send(x, WS_TEXT, buf, (size_t)n);
 }
 
-static void ws_close(http_ctx* x, int code, const char* reason) {
+void ws_close(http_ctx* x, int code, const char* reason) {
     ws_request_close(x, code, reason, reason ? strlen(reason) : 0);
 }
 
@@ -2262,7 +2155,7 @@ static void ps_wake(struct ps_sub* s) {
     ps_post_wake(atomic_load(&s->owner), s);
 }
 
-static int ps_publish(const char* topic, int opcode, const void* data, size_t len) {
+int ps_publish(const char* topic, int opcode, const void* data, size_t len) {
     size_t tlen = strlen(topic);
     struct ps_msg* m = malloc(sizeof *m + len + tlen + 1);
     if (!m) return 0;
@@ -2290,7 +2183,7 @@ static int ps_publish(const char* topic, int opcode, const void* data, size_t le
     return n;
 }
 
-static bool ps_subscribe(http_ctx* x, const char* topic) {
+bool ps_subscribe(http_ctx* x, const char* topic) {
     struct conn* c = x->c;
     struct ps_sub* s = c->sub;
     if (!s) {
@@ -2361,7 +2254,7 @@ static void ps_detach(struct ps_sub* s, const char* topic) {
     }
 }
 
-static void ps_unsubscribe(http_ctx* x, const char* topic) {
+void ps_unsubscribe(http_ctx* x, const char* topic) {
     struct ps_sub* s = x->c->sub;
     if (!s) return;
     for (int i = 0; i < s->ntopics; ++i) {
@@ -2396,7 +2289,7 @@ static void ps_release(struct conn* c) {
     ps_sub_unref(s);                                /* drop the connection's reference */
 }
 
-static bool ps_ready(http_ctx* x) {
+bool ps_ready(http_ctx* x) {
     struct ps_sub* s = x->c->sub;
     if (!s) return false;
     if (s->held) { ps_msg_unref(s->held); s->held = NULL; }   /* done with the previous one */
@@ -2406,7 +2299,7 @@ static bool ps_ready(http_ctx* x) {
     return has;
 }
 
-static ps_message ps_recv(http_ctx* x) {
+ps_message ps_recv(http_ctx* x) {
     struct ps_sub* s = x->c->sub;
     if (!s) return (ps_message){"", 0, "", 0};
     if (s->held) { ps_msg_unref(s->held); s->held = NULL; }
@@ -2418,7 +2311,7 @@ static ps_message ps_recv(http_ctx* x) {
     return (ps_message){m->topic, m->opcode, m->data, m->len};
 }
 
-static unsigned ps_lagged(http_ctx* x) {
+unsigned ps_lagged(http_ctx* x) {
     struct ps_sub* s = x->c->sub;
     if (!s) return 0;
     pthread_mutex_lock(&s->mu);
@@ -2523,7 +2416,7 @@ static bool header_name_is(const http_header* h, const char* name) {
     return h->name.len == n && strncasecmp(h->name.ptr, name, n) == 0;
 }
 
-static const char* http_client_ip(http_ctx* x) {
+const char* http_client_ip(http_ctx* x) {
     if (x->client_ip[0]) return x->client_ip;
     ipaddr who = x->c->client;
     if (ip_trusted(&who)) {
@@ -2556,7 +2449,7 @@ static const char* http_client_ip(http_ctx* x) {
     return x->client_ip;
 }
 
-static const char* http_scheme(http_ctx* x) {
+const char* http_scheme(http_ctx* x) {
     struct conn* c = x->c;
     if (c->client_tls) return "https";
     if (ip_trusted(&c->client)) {
@@ -3886,6 +3779,7 @@ static void* reactor_run(void* arg) {
     return NULL;
 }
 
+#ifndef SERVER_NO_MAIN                 /* only the demo's /stats uses it */
 static int format_stats(char* buf, size_t cap, const struct reactor* self) {
     long total_req = 0, total_mig = 0; int total_act = 0, len = 0;
     for (int i = 0; i < g_nreactors; ++i) {
@@ -3918,8 +3812,10 @@ static int format_stats(char* buf, size_t cap, const struct reactor* self) {
 #endif
     return len;
 }
+#endif
 
 
+#ifndef SERVER_NO_MAIN                 /* the demo routes: left out of the library build */
 /* ======================================================================== */
 /* Demo application                                                         */
 /* ======================================================================== */
@@ -3964,7 +3860,7 @@ static void h_user(http_ctx* x) {
                       "{\"id\":\"%s\",\"method\":\"%.*s\",\"path\":\"%s\",\"user_agent\":\"%s\",\"reactor\":%d}\n",
                       id, (int)m.len, m.ptr, path, agent, x->c->r->id);
     }
-    else
+else
         http_respondf(x, 200, "application/json", "{\"id\":\"%s\"}\n", id);
 }
 
@@ -4256,6 +4152,7 @@ static const http_route app_routes[] = {
     {"GET",  "/work",         .handle = h_work},
     {0},
 };
+#endif /* SERVER_NO_MAIN */
 
 /* ======================================================================== */
 /* main                                                                     */
@@ -4289,7 +4186,7 @@ static void usage(const char* prog) {
         prog, DEFAULT_KEEPALIVE_MS, TIMEOUT_MS);
 }
 
-int main(int argc, char* argv[]) {
+int http_server_main(int argc, char* argv[], const http_route* routes) {
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "WSAStartup failed\n"); return 1; }
@@ -4332,7 +4229,7 @@ int main(int argc, char* argv[]) {
     g_parser_settings.on_headers_complete = on_headers_complete;
     g_parser_settings.on_body = on_body;
     g_parser_settings.on_message_complete = on_message_complete;
-    g_routes = app_routes;
+    g_routes = routes;
 
     g_nreactors = nthreads;
     g_reactors = calloc((size_t)nthreads, sizeof *g_reactors);
@@ -4395,3 +4292,7 @@ int main(int argc, char* argv[]) {
     free(g_reactors);
     return 0;
 }
+
+#ifndef SERVER_NO_MAIN
+int main(int argc, char* argv[]) { return http_server_main(argc, argv, app_routes); }
+#endif

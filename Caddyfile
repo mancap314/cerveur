@@ -1,0 +1,19 @@
+# Caddy in front of the STC server: automatic HTTPS (Let's Encrypt), HTTP/2 and
+# HTTP/3, compression, WebSockets and server-sent events work out of the box.
+#
+# Start the server behind it with:
+#   ./server --bind=127.0.0.1 --trust-proxy=127.0.0.1 --keepalive=75000 8080
+
+example.com {
+    encode zstd gzip
+    request_body {
+        max_size 64MB
+    }
+    reverse_proxy 127.0.0.1:8080 {
+        # Caddy sets X-Forwarded-For/-Proto itself and ignores client-supplied ones.
+        transport http {
+            keepalive 60s          # [!] must be below the server's --keepalive (75s);
+                                   #     Caddy's default (2m) is longer
+        }
+    }
+}

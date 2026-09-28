@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  WARN: -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
+  LLHTTP: llhttp/src/api.c llhttp/src/http.c llhttp/src/llhttp.c
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc
+            cxx: g++
+          - cc: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: deploy/fetch_deps.sh && pip install websockets
+      - name: Build (warnings are errors in the server's own code)
+        run: |
+          ${{ matrix.cc }} -std=gnu11 -O2 $WARN -Werror -pthread -Illhttp/include -c server.c -o server.o
+          ${{ matrix.cc }} -std=gnu11 -O2 -pthread -Illhttp/include -o server server.o $LLHTTP
+      - name: Library build and C++ example
+        run: |
+          ${{ matrix.cc }} -std=gnu11 -O2 $WARN -Werror -pthread -Illhttp/include -DSERVER_NO_MAIN -c server.c -o lib.o
+          ${{ matrix.cc }} -std=gnu11 -O2 -pthread -Illhttp/include -c $LLHTTP
+          ${{ matrix.cxx }} -std=c++17 -O2 -Wall -pthread -Illhttp/include example.cpp lib.o api.o http.o llhttp.o -o example
+      - name: Tests
+        run: deploy/run_tests.sh ./server
+
+  sanitizers:
+    name: Linux (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # ThreadSanitizer slows the server 5-15x, which can trip the suites' timing
+    # checks; it reports but doesn't fail the build until it has a clean record.
+    continue-on-error: ${{ matrix.name == 'tsan' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: asan+ubsan
+            flags: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+            options: ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1
+          - name: tsan
+            flags: -fsanitize=thread
+            options: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: deploy/fetch_deps.sh && pip install websockets
+      - name: Build
+        run: clang -std=gnu11 -O1 -g ${{ matrix.flags }} -pthread -Illhttp/include -o server server.c $LLHTTP
+      - name: Tests
+        run: env ${{ matrix.options }} deploy/run_tests.sh ./server
+
+  fuzz:
+    name: Fuzzing (libFuzzer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: deploy/fetch_deps.sh
+      - name: Build the fuzz targets
+        run: |
+          for t in http ws proxy fmt; do
+            # standalone build, only to write the target's seeds as a starting corpus
+            gcc -std=gnu11 -O1 -w -DFUZZ_STANDALONE -pthread -Illhttp/include fuzz/fuzz_$t.c $LLHTTP -o seeds_$t
+            mkdir -p corpus/$t && ./seeds_$t --write-seeds corpus/$t
+            clang -std=gnu11 -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+                -pthread -Illhttp/include fuzz/fuzz_$t.c $LLHTTP -o fuzz_$t
+          done
+      - name: Fuzz each target for 60 s
+        run: |
+          status=0
+          for t in http ws proxy fmt; do
+            echo "=== fuzz_$t"
+            ./fuzz_$t -max_total_time=60 -timeout=10 -rss_limit_mb=2048 -print_final_stats=1 \
+                -artifact_prefix=crash-$t- corpus/$t || status=1
+          done
+          exit $status
+      - name: Keep failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: crash-*
+
+  proxy:
+    name: Behind nginx, Caddy and HAProxy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          deploy/fetch_deps.sh && pip install websockets
+          sudo apt-get update -q && sudo apt-get install -y -q nginx haproxy
+          curl -sSfL https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz \
+              | tar -xz caddy && sudo mv caddy /usr/local/bin/
+      - name: Build (shortened timers)
+        run: deploy/build_test_server.sh
+      - name: Start the stack
+        run: sudo deploy/start_test_stack.sh
+      - name: Tests
+        run: python3 test_proxy.py
+
+  windows:
+    name: Windows (MinGW-w64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          install: mingw-w64-x86_64-gcc git curl
+      - name: Dependencies
+        run: deploy/fetch_deps.sh && python -m pip install websockets
+      - name: Build (warnings are errors in the server's own code)
+        run: |
+          gcc -std=gnu11 -O3 $WARN -Werror -pthread -Illhttp/include -c server.c -o server.o
+          gcc -std=gnu11 -O3 -pthread -Illhttp/include -o server.exe server.o $LLHTTP -lws2_32
+      - name: Library build and C++ example
+        run: |
+          gcc -std=gnu11 -O3 $WARN -Werror -pthread -Illhttp/include -DSERVER_NO_MAIN -c server.c -o lib.o
+          gcc -std=gnu11 -O3 -pthread -Illhttp/include -c $LLHTTP
+          g++ -std=c++17 -O2 -Wall -pthread -Illhttp/include example.cpp lib.o api.o http.o llhttp.o -o example.exe -lws2_32
+      - name: Tests
+        run: PYTHON=python deploy/run_tests.sh ./server.exe
+      - name: Fuzz each target for 30 s (standalone driver)
+        run: |
+          for t in http ws proxy fmt; do
+            gcc -std=gnu11 -g -O1 -w -DFUZZ_STANDALONE -pthread -Illhttp/include fuzz/fuzz_$t.c $LLHTTP -o fuzz_$t.exe -lws2_32
+            FUZZ_SECONDS=30 ./fuzz_$t.exe
+          done

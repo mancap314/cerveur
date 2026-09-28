@@ -14,6 +14,13 @@
 /deploy/test.crt
 /deploy/test.key
 
+# Fuzzing and test runs
+/fuzz_*
+!/fuzz/
+crash-*
+corpus/
+server-test.log
+
 # Python
 __pycache__/
 *.pyc

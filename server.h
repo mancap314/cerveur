@@ -1,6 +1,8 @@
 /*
  * server.h - public API of server.c, for applications in C or C++.
  *
+ * Copyright (c) 2026 Manuel Capel. SPDX-License-Identifier: MIT
+ *
  * Build server.c as a library with -DSERVER_NO_MAIN (this leaves out its demo
  * routes and main()), and start the server from your own program with a
  * route table:
@@ -54,8 +56,8 @@
 #define OUT_CAP       32768
 #endif
 
-#if defined(__GNUC__) && defined(__MINGW32__)
-#define HTTP_PRINTF(f, a) __attribute__((format(gnu_printf, f, a)))
+#if defined(__GNUC__) && defined(__MINGW32__) && !defined(__clang__)
+#define HTTP_PRINTF(f, a) __attribute__((format(gnu_printf, f, a)))   /* MinGW gcc: C99 formats */
 #elif defined(__GNUC__)
 #define HTTP_PRINTF(f, a) __attribute__((format(printf, f, a)))
 #else

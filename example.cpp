@@ -1,4 +1,5 @@
 // example.cpp - using the server from C++.
+// Copyright (c) 2026 Manuel Capel. SPDX-License-Identifier: MIT
 //
 // Build (Linux; on Windows add -lws2_32, e.g. from Git Bash with MinGW-w64):
 //   gcc -c -O2 -pthread -Illhttp/include -DSERVER_NO_MAIN server.c llhttp/src/api.c llhttp/src/http.c llhttp/src/llhttp.c

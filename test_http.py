@@ -136,9 +136,19 @@ c = Conn(); c.send(b"POST /count HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunk
 st, h, b = c.response(); check("malformed chunk framing in streamed body -> 400", st == 400)
 
 print("real client (curl)")
-open("/tmp/big.bin", "wb").write(os.urandom(30_000_000))
-r = subprocess.run(f"curl -s --data-binary @/tmp/big.bin -H 'Content-Type: application/octet-stream' http://localhost:{PORT}/echo | cmp - /tmp/big.bin", shell=True)
-check("curl: 30 MB echo byte-identical (curl uses Expect: 100-continue)", r.returncode == 0)
-r = subprocess.run(f"curl -s -T /tmp/big.bin -X POST http://localhost:{PORT}/count", shell=True, capture_output=True)
-check("curl: 30 MB chunked upload to streaming consumer", fnv(open('/tmp/big.bin','rb').read()).encode() in r.stdout, r.stdout)
+import tempfile
+big = os.urandom(30_000_000)
+with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+    f.write(big)
+try:
+    r = subprocess.run(["curl", "-s", "--data-binary", "@" + f.name, "-H", "Content-Type: application/octet-stream",
+                        f"http://127.0.0.1:{PORT}/echo"], capture_output=True, timeout=120)
+    check("curl: 30 MB echo byte-identical (curl uses Expect: 100-continue)", r.stdout == big,
+          f"got {len(r.stdout)} bytes")
+    r = subprocess.run(["curl", "-s", "-T", f.name, "-X", "POST", f"http://127.0.0.1:{PORT}/count"],
+                       capture_output=True, timeout=120)
+    check("curl: 30 MB chunked upload to streaming consumer", fnv(big).encode() in r.stdout, r.stdout)
+finally:
+    os.unlink(f.name)
 print(f"\n{passed} passed, {failed} failed")
+sys.exit(1 if failed else 0)

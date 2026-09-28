@@ -4,7 +4,7 @@
 #   8082 server C (trusts nobody)                              8445 HAProxy -> B (PROXY v2 + TLS TLV)
 # The server is built with TIMEOUT_MS=2000 WS_PING_MS=3000 WS_PONG_MS=2000
 # WS_STALL_MS=6000 SSE_KEEPALIVE_MS=3000 (see deploy/build_test_server.sh). "Outside" clients connect from 127.0.0.2.
-import socket, ssl, json, time, struct, os, subprocess, threading, asyncio, warnings, logging
+import socket, ssl, json, time, struct, os, subprocess, sys, threading, asyncio, warnings, logging
 warnings.filterwarnings("ignore"); logging.disable(logging.CRITICAL)
 import websockets
 from websockets.sync.client import connect as ws_connect
@@ -234,3 +234,4 @@ for rnd in range(3):
     time.sleep(5)
 check("requests after 5s pauses (pooled connections expire at the proxy first): no errors", errors == 0, errors)
 print(f"\n{passed} passed, {failed} failed")
+sys.exit(1 if failed else 0)

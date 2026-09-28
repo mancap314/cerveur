@@ -1,6 +1,7 @@
 # cerveur
 
-A multi-core HTTP/1.1 server in a single C file. It parses HTTP with
+A multi-core HTTP/1.1 server in C, built from a single source file
+(`server.c`, which includes the parts in `src/`). It parses HTTP with
 [llhttp](https://github.com/nodejs/llhttp) (Node.js's parser) and runs every
 connection as a stackless coroutine from [STC](https://github.com/stclib/STC),
 one event loop per CPU core, moving busy connections between cores when one
@@ -80,7 +81,8 @@ anything else: printf was the main cost of handlers that format their output.
 
 ## Building
 
-The server needs two dependencies, downloaded next to `server.c`:
+The server needs two dependencies, downloaded next to `server.c` by
+`deploy/fetch_deps.sh` (or by hand):
 
     mkdir -p stc && curl -sSLo stc/coroutine.h \
         https://raw.githubusercontent.com/stclib/stcsingle/main/stc/coroutine.h
@@ -158,7 +160,7 @@ int main(int argc, char** argv) { return http_server_main(argc, argv, routes); }
 `http_server_main` takes the same command-line options as the demo.
 `example.cpp` shows a buffered handler (a plain function or a capture-less
 lambda), a streaming handler with a timer, and a WebSocket handler in C++. The
-demo handlers at the end of `server.c` cover the rest of the API.
+demo handlers in `src/demo.c` cover the rest of the API.
 
 Streaming and WebSocket handlers are coroutines, so local variables do not
 survive a `cco_await`: keep that state in the task struct (which starts with
@@ -252,12 +254,18 @@ a `-DIO_STATS` build it also shows system calls per request.
 ## Testing
 
 The test suites run against a running server (they need Python 3 and
-`pip install websockets`):
+`pip install websockets`, and exit with status 1 if a check fails):
 
-    ./server 8080 &
+    deploy/run_tests.sh ./server       # starts it, runs the three suites, stops it
+
+    ./server 8080 &                    # or by hand:
     python3 test_http.py 8080      # HTTP/1.1: routing, bodies, streaming, pipelining, limits (29 checks)
     python3 test_ws.py 8080        # WebSocket protocol, timers, idle timeouts (35 checks)
     python3 test_ps.py 8080        # pub/sub: rooms, fan-out, ordering, slow subscribers (14 checks)
+
+`deploy/run_tests.sh` also fails if the server dies, if a sanitizer reports
+anything, or (on Linux) if it doesn't shut down cleanly. On Windows, run it
+from Git Bash with `PYTHON=python`.
 
 The proxy tests use a build with shortened timers and real proxies (Linux):
 
@@ -268,17 +276,46 @@ The proxy tests use a build with shortened timers and real proxies (Linux):
 On Windows, `deploy/build_test_server.sh` works from Git Bash, but
 `start_test_stack.sh` is Linux-only; the proxy-independent parts of
 `test_proxy.py` can be run against three `server_t` instances started by hand.
-One check in `test_http.py` pipes curl into `cmp` through the shell and fails
-under `cmd.exe` although the server's output is correct.
+
+**Sanitizers.** Build with Clang and `-fsanitize=address,undefined` (or
+`-fsanitize=thread`) and run `deploy/run_tests.sh` on the result.
+
+**Fuzzing.** `fuzz/` has four targets for the code that parses untrusted input:
+requests (`fuzz_http.c`: parser callbacks, router, bodies, query decoding,
+`X-Forwarded-For`), WebSocket frames (`fuzz_ws.c`), PROXY protocol headers and
+address parsing (`fuzz_proxy.c`), and the formatter checked against the C
+library's `vsnprintf` (`fuzz_fmt.c`). With Clang they build with libFuzzer:
+
+    clang -g -O1 -fsanitize=fuzzer,address,undefined -Illhttp/include fuzz/fuzz_http.c \
+        llhttp/src/api.c llhttp/src/http.c llhttp/src/llhttp.c -pthread -o fuzz_http
+    ./fuzz_http -max_total_time=300 corpus/
+
+With any other compiler, add `-DFUZZ_STANDALONE` (and `-lws2_32` on Windows)
+for a simple built-in driver that mutates the targets' example inputs
+(`FUZZ_SECONDS=60 ./fuzz_http`, or `./fuzz_http crash-file` to replay one).
+
+**Continuous integration.** `.github/workflows/ci.yml` builds and tests on
+Linux (gcc and clang, warnings as errors), runs the suites under
+AddressSanitizer + UndefinedBehaviorSanitizer and ThreadSanitizer, fuzzes each
+target for a minute, runs the proxy tests behind real nginx, Caddy and HAProxy,
+and builds and tests on Windows (MinGW-w64).
 
 ## Files
 
 | File | Contents |
 |---|---|
-| `server.c` | The whole server, plus the demo routes. |
+| `server.c` | What you compile: overview, includes and tunable limits; includes the files in `src/` in order. |
+| `src/` | The server's code by topic: `platform.c`, `runtime.c`, `http.c`, `websocket.c`, `pubsub.c`, `proxy.c`, `connection.c`, `reactor.c`, `eventloop.c`, `demo.c` (demo routes), `main.c`. Not compiled on their own. |
 | `server.h` | Public API for handlers, and `http_server_main()` for library builds. |
 | `example.cpp` | Using the server from C++. |
 | `bench.py` | Benchmark driver (oha-based). |
 | `test_http.py`, `test_ws.py`, `test_ps.py`, `test_proxy.py` | Test suites. |
+| `fuzz/` | Fuzz targets (libFuzzer, or a built-in driver). |
 | `Caddyfile`, `nginx.conf`, `haproxy.cfg` | Reverse-proxy configurations. |
-| `deploy/` | Test build and local proxy stack scripts. |
+| `deploy/` | Scripts: fetch the dependencies, run the test suites, test build, local proxy stack. |
+| `.github/workflows/ci.yml` | Continuous integration (GitHub Actions). |
+
+## License
+
+MIT, see [LICENSE](LICENSE). The dependencies are MIT-licensed as well:
+[llhttp](https://github.com/nodejs/llhttp) and [STC](https://github.com/stclib/STC).

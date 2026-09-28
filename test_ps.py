@@ -127,7 +127,24 @@ class RawWS:                                    # a client that can genuinely st
     def send(s, text):
         p = text.encode(); key = os.urandom(4)
         s.s.sendall(bytes([0x81, 0x80 | len(p)]) + key + bytes(b ^ key[i & 3] for i, b in enumerate(p)))
-slow = RawWS("/ws/chat/flood"); fast = chat("flood"); pub = chat("flood"); time.sleep(0.5)
+class RawPub(RawWS):
+    """The publisher: sends from one thread while another drains what the room
+    sends back to it. Not the websockets client: its blocking send() holds a lock
+    its receiving thread needs, so once both directions' buffers fill (the
+    publisher is subscribed to the room it floods), it stops reading while the
+    server waits for it to read, and both wait forever."""
+    def send_text(s, text):
+        p = text.encode(); n = len(p)                # masked with a zero key (valid, and cheap)
+        hdr = bytes([0x81, 0x80 | 126]) + struct.pack(">H", n) if n >= 126 else bytes([0x81, 0x80 | n])
+        s.s.sendall(hdr + b"\0\0\0\0" + p)
+    def recv_text(s):                                # like RawWS.recv, but never sends (no pongs)
+        while True:
+            s.need(2); op = s.buf[0] & 0x0F; n = s.buf[1] & 0x7F; off = 2
+            if n == 126: s.need(4); n = struct.unpack(">H", s.buf[2:4])[0]; off = 4
+            elif n == 127: s.need(10); n = struct.unpack(">Q", s.buf[2:10])[0]; off = 10
+            s.need(off + n); p = s.buf[off:off+n]; s.buf = s.buf[off+n:]
+            if op in (1, 2): return p.decode(errors="replace")
+slow = RawWS("/ws/chat/flood"); fast = chat("flood"); pub = RawPub("/ws/chat/flood"); time.sleep(0.5)
 M = 20000; payload = "x" * 1000
 fast_seq = []; fast_skip = [0]
 def fast_reader():
@@ -141,13 +158,13 @@ def pub_reader():
     n = 0
     try:
         while n < M:
-            m = pub.recv(timeout=30)
+            m = pub.recv_text()
             if m.startswith("f "): n += 1
             elif "skipped" in m: n += int(m.split()[1])
     except Exception: pass
 ft = threading.Thread(target=fast_reader); pt = threading.Thread(target=pub_reader); ft.start(); pt.start()
 t0 = time.time()
-for k in range(M): pub.send(f"f {k:05d} {payload}")
+for k in range(M): pub.send_text(f"f {k:05d} {payload}")
 pub_time = time.time() - t0
 ft.join(); pt.join()
 increasing = all(isinstance(a, int) and a < b for a, b in zip(fast_seq, fast_seq[1:]))
@@ -166,5 +183,6 @@ slow.send("still alive")
 while True:
     if slow.recv() == "still alive": break
 check("stalled subscriber still works afterwards", True)
-fast.close(); pub.close()
+fast.close(); pub.s.close()
 print(f"\n{passed} passed, {failed} failed")
+sys.exit(1 if failed else 0)

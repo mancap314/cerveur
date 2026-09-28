@@ -148,3 +148,4 @@ with connect(f"{BASE}/ws/echo") as ws:
     check("WebSocket idle 12 s (> 10 s HTTP timeout) stays open", ok)
     check(f"handler sleeping 11 s isn't killed by the 10 s idle timeout ({lived[0][1]:.1f}s)", lived[0][0].count(b"data: tick") == 2)
 print(f"\n{passed} passed, {failed} failed")
+sys.exit(1 if failed else 0)

@@ -1,5 +1,8 @@
 # cerveur
 
+[![CI](https://github.com/mancap314/cerveur/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mancap314/cerveur/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A multi-core HTTP/1.1 server in C, built from a single source file
 (`server.c`, which includes the parts in `src/`). It parses HTTP with
 [llhttp](https://github.com/nodejs/llhttp) (Node.js's parser) and runs every

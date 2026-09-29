@@ -23,8 +23,13 @@ jobs:
             cxx: clang++
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Dependencies
-        run: deploy/fetch_deps.sh && pip install websockets
+        run: |
+          deploy/fetch_deps.sh
+          pip install websockets
       - name: Build (warnings are errors in the server's own code)
         run: |
           ${{ matrix.cc }} -std=gnu11 -O2 $WARN -Werror -pthread -Illhttp/include -c server.c -o server.o
@@ -55,8 +60,13 @@ jobs:
             options: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Dependencies
-        run: deploy/fetch_deps.sh && pip install websockets
+        run: |
+          deploy/fetch_deps.sh
+          pip install websockets
       - name: Build
         run: clang -std=gnu11 -O1 -g ${{ matrix.flags }} -pthread -Illhttp/include -o server server.c $LLHTTP
       - name: Tests
@@ -99,9 +109,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Dependencies
         run: |
-          deploy/fetch_deps.sh && pip install websockets
+          deploy/fetch_deps.sh
+          pip install websockets
           sudo apt-get update -q && sudo apt-get install -y -q nginx haproxy
           curl -sSfL https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz \
               | tar -xz caddy && sudo mv caddy /usr/local/bin/
@@ -129,7 +143,9 @@ jobs:
           path-type: inherit
           install: mingw-w64-x86_64-gcc git curl
       - name: Dependencies
-        run: deploy/fetch_deps.sh && python -m pip install websockets
+        run: |
+          deploy/fetch_deps.sh
+          python -m pip install websockets
       - name: Build (warnings are errors in the server's own code)
         run: |
           gcc -std=gnu11 -O3 $WARN -Werror -pthread -Illhttp/include -c server.c -o server.o

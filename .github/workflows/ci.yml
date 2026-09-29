@@ -12,7 +12,7 @@ env:
 jobs:
   linux:
     name: Linux (${{ matrix.cc }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -22,8 +22,8 @@ jobs:
           - cc: clang
             cxx: clang++
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Dependencies
@@ -44,7 +44,7 @@ jobs:
 
   sanitizers:
     name: Linux (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # ThreadSanitizer slows the server 5-15x, which can trip the suites' timing
     # checks; it reports but doesn't fail the build until it has a clean record.
     continue-on-error: ${{ matrix.name == 'tsan' }}
@@ -59,8 +59,8 @@ jobs:
             flags: -fsanitize=thread
             options: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Dependencies
@@ -74,9 +74,9 @@ jobs:
 
   fuzz:
     name: Fuzzing (libFuzzer)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Dependencies
         run: deploy/fetch_deps.sh
       - name: Build the fuzz targets
@@ -99,17 +99,17 @@ jobs:
           exit $status
       - name: Keep failing inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crashes
           path: crash-*
 
   proxy:
     name: Behind nginx, Caddy and HAProxy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Dependencies
@@ -125,6 +125,9 @@ jobs:
         run: sudo deploy/start_test_stack.sh
       - name: Tests
         run: python3 test_proxy.py
+      - name: Stack logs
+        if: failure()
+        run: sudo sh -c 'for f in /tmp/stack/*.log /tmp/stack/*.txt; do [ -f "$f" ] && { echo "=== $f"; tail -n 50 "$f"; }; done' || true
 
   windows:
     name: Windows (MinGW-w64)
@@ -133,8 +136,8 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - uses: msys2/setup-msys2@v2

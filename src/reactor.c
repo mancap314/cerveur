@@ -35,7 +35,10 @@ static void io_kick(struct conn* c) { (void)c; }
 static bool resume(struct conn* c) {
     for (int again = 0;; ++again) {
         if (c->dead) return false;
-        if (cco_resume(c) == cco_DONE) {
+        /* Called directly rather than with cco_resume(), which goes through
+           STC's generic int (*)(struct cco_task*) pointer: calling conn_run
+           through that type is undefined (UBSan's -fsanitize=function). */
+        if (conn_run(c) == cco_DONE) {
             c->dead = true;
             c->dead_next = c->r->graveyard;
             c->r->graveyard = c;
